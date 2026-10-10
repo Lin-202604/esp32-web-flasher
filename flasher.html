@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 网页烧录 / 调试</title>
+<style>
+  :root { --bg:#16181d; --panel:#1f2229; --line:#2d313a; --fg:#d7dae0; --dim:#8b919d; --acc:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif; }
+  .wrap { max-width:920px; margin:0 auto; padding:16px; }
+  h1 { font-size:17px; margin:0 0 12px; }
+  .bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
+  .dot.on { background:var(--ok); }
+  .dot.run { background:var(--acc); }
+  select, input[type=text], input:not([type]) { background:#121419; color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:5px 8px; }
+  input[type=file] { color:var(--dim); font-size:12px; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:5px; padding:6px 14px; cursor:pointer; font-size:13px; }
+  button.sec { background:#343945; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button.danger { background:var(--err); }
+  .tabs { display:flex; gap:4px; margin-bottom:0; }
+  .tabs button { background:transparent; color:var(--dim); border-radius:6px 6px 0 0; border:1px solid transparent; }
+  .tabs button.act { color:var(--fg); background:var(--panel); border-color:var(--line); border-bottom-color:var(--panel); }
+  .pane { background:var(--panel); border:1px solid var(--line); border-radius:0 8px 8px 8px; padding:14px; display:none; }
+  .pane.act { display:block; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  label { color:var(--dim); font-size:12px; }
+  progress { width:100%; height:14px; }
+  #term { width:100%; height:380px; background:#0d0f13; color:#c8e6c9; border:1px solid var(--line); border-radius:6px; padding:8px; font:12px/1.45 Consolas,monospace; resize:vertical; overflow:auto; white-space:pre-wrap; word-break:break-all; }
+  #sendrow { display:flex; gap:8px; margin-top:8px; }
+  #sendInput { flex:1; }
+  .hint { color:var(--dim); font-size:12px; margin-top:10px; }
+  .err { color:var(--err); }
+  .pm-chip { width:62px; border:1px solid var(--line); border-radius:6px; padding:4px 5px; text-align:center;
+    font:11px Consolas,monospace; background:#121419; cursor:pointer; user-select:none; }
+  .pm-chip .n { color:var(--dim); font-size:10px; }
+  .pm-chip .v { font-size:13px; font-weight:bold; }
+  .pm-chip.hi { background:#14361d; border-color:#2f7d43; color:#7ee29a; }
+  .pm-chip.lo { background:#1a1d23; color:var(--dim); }
+  .pm-chip.ad { background:#122a47; border-color:#2a63a8; color:#8ec5ff; }
+  .pm-chip.skip { opacity:.35; }
+  .pm-chip.bad { opacity:.18; cursor:not-allowed; }
+  .pm-chip.bad .v { color:var(--err); }
+  .pm-chip.changed { outline:2px solid var(--warn); }
+  .pm-chip.mon { cursor:default; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ESP32 网页烧录 / 串口调试</h1>
+
+  <div class="bar">
+    <span class="dot" id="dot"></span>
+    <span id="status">未连接</span>
+    <span style="flex:1"></span>
+    <label>波特率
+      <select id="baud">
+        <option>115200</option><option>230400</option>
+        <option selected>460800</option><option>921600</option>
+      </select>
+    </label>
+    <button id="btnConnect">连接串口</button>
+    <button id="btnDisconnect" class="sec" disabled>断开</button>
+  </div>
+
+  <div class="tabs">
+    <button id="tabFlash" class="act">固件烧录</button>
+    <button id="tabMon">串口调试</button>
+    <button id="tabIDE">文件 / MicroPython</button>
+    <button id="tabPins">引脚监测</button>
+  </div>
+
+  <div class="pane act" id="paneFlash">
+    <div class="row">
+      <input type="file" id="fwFile" accept=".bin">
+      <label>烧录地址
+        <input type="text" id="fwAddr" value="0x0" size="8">
+      </label>
+      <label><input type="checkbox" id="eraseAll"> 烧录前整片擦除</label>
+    </div>
+    <div class="row">
+      <button id="btnFlash" disabled>开始烧录</button>
+      <button id="btnErase" class="danger" disabled>整片擦除</button>
+    </div>
+    <progress id="prog" value="0" max="1"></progress>
+    <div class="hint">
+      merged 合并固件填 <b>0x0</b>；仅 app 固件通常填 <b>0x10000</b>（C3/S3 同）。
+      要求带自动复位电路的开发板（DTR/RTS）。
+    </div>
+  </div>
+
+  <div class="pane" id="paneIDE">
+    <div style="display:flex;gap:14px;flex-wrap:wrap">
+      <div style="flex:1;min-width:220px">
+        <div class="row">
+          <button id="btnRefresh" class="sec">刷新文件</button>
+          <button id="btnUpload" class="sec">上传文件</button>
+          <input type="file" id="upFile" style="display:none">
+        </div>
+        <select id="fileList" size="13" style="width:100%;font-family:Consolas,monospace"></select>
+        <div class="row" style="margin-top:8px">
+          <button id="btnOpen" class="sec">下载/打开</button>
+          <button id="btnDel" class="danger">删除</button>
+        </div>
+      </div>
+      <div style="flex:2;min-width:340px">
+        <div class="row">
+          <label>板端文件名
+            <input type="text" id="edName" value="main.py" size="14">
+          </label>
+          <button id="btnRun">▶ 运行(不保存)</button>
+          <button id="btnSave" class="sec">保存到板子</button>
+          <button id="btnStop" class="danger">Ctrl-C</button>
+          <button id="btnReboot" class="sec">软重启进 raw</button>
+        </div>
+        <textarea id="editor" spellcheck="false"
+          style="width:100%;height:250px;background:#0d0f13;color:#e6e6e6;border:1px solid var(--line);border-radius:6px;padding:8px;font:13px Consolas,monospace"></textarea>
+        <label style="margin:6px 0;display:block">运行输出 / REPL：</label>
+        <div id="out" style="height:140px;background:#0d0f13;border:1px solid var(--line);border-radius:6px;padding:6px;font:12px Consolas,monospace;overflow:auto;white-space:pre-wrap;word-break:break-all"></div>
+      </div>
+    </div>
+    <div class="hint">仅在已刷入 MicroPython 的板子上可用。运行前会自动进入 raw REPL；像 Thonny 一样直接执行编辑器内容，MicroPython 运行时编译。下载/打开适合源码小文件（&lt;~150KB）。</div>
+  </div>
+
+  <div class="pane" id="panePins">
+    <div class="row">
+      <label>板子
+        <select id="pmChip">
+          <option value="s3">ESP32-S3</option>
+          <option value="esp32">ESP32</option>
+          <option value="c3">ESP32-C3</option>
+        </select>
+      </label>
+      <label>默认上拉
+        <select id="pmPull">
+          <option value="none">悬空</option>
+          <option value="up" selected>上拉</option>
+          <option value="down">下拉</option>
+        </select>
+      </label>
+      <label>间隔
+        <select id="pmInterval">
+          <option value="300">300ms</option>
+          <option value="500" selected>500ms</option>
+          <option value="1000">1s</option>
+        </select>
+      </label>
+      <button id="pmStart">开始监测</button>
+      <button id="pmStop" class="sec" disabled>停止</button>
+      <span id="pmStatus" style="color:var(--dim)"></span>
+    </div>
+    <div class="row">
+      <button id="pmAllDigital" class="sec">全部数字</button>
+      <button id="pmAllAdc" class="sec">全部 ADC1</button>
+      <button id="pmAllSkip" class="sec">全部跳过</button>
+      <span style="color:var(--dim);font-size:12px">停止后点引脚切换：数字 → ADC → 跳过</span>
+    </div>
+    <div class="row" style="border-top:1px solid var(--line);padding-top:10px">
+      <label>GPIO <input type="number" id="pcPin" min="0" max="48" value="2" style="width:60px"></label>
+      <label>方式
+        <select id="pcKind">
+          <option value="d">数字输出</option>
+          <option value="p">PWM (1kHz)</option>
+        </select>
+      </label>
+      <button id="pcToggle" class="sec">置高</button>
+      <span id="pcPwmRow" style="display:none">
+        <input type="range" id="pcDuty" min="0" max="1023" value="0" style="vertical-align:middle">
+        <span id="pcDutyVal" style="color:var(--dim);font:12px Consolas">0</span>
+      </span>
+      <span id="pcStatus" style="color:var(--dim)"></span>
+    </div>
+    <div id="pmGrid" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+    <div class="hint">
+      开始监测时自动探测本模组可用引脚，Flash/PSRAM 占用脚标记为 ✕ 不可选（S3 典型不可用 26-32；C3 11-17）。
+      ADC2 脚在 WiFi 工作时读取会失败（S3 GPIO11-20；ESP32 见 ADC2 通道）。Strapping/USB 脚谨慎接线。
+    </div>
+  </div>
+
+  <div class="pane" id="paneMon">
+    <div class="row">
+      <button id="btnMon" class="sec" disabled>开始监视</button>
+      <button id="btnReset" class="sec" disabled>复位(EN)</button>
+      <button id="btnClear" class="sec">清空</button>
+      <label><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+    </div>
+    <div id="term"></div>
+    <div id="sendrow">
+      <input type="text" id="sendInput" placeholder="输入发送内容，回车发送">
+      <label><input type="checkbox" id="addNL" checked> 追加 \n</label>
+      <button id="btnSend" class="sec" disabled>发送</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { ESPLoader, Transport } from "https://esm.sh/esptool-js@0.5.3";
+
+const $ = id => document.getElementById(id);
+let port = null, monitoring = false, reader = null, writer = null, monitorBaud = 115200, mp = null;
+const ACTION_BTNS = ["btnFlash","btnErase","btnMon","btnReset","btnSend",
+  "btnRefresh","btnUpload","btnOpen","btnDel","btnRun","btnSave","btnStop","btnReboot"];
+
+const term = {
+  clean() { $("term").textContent = ""; },
+  write(d) { appendLog(typeof d === "string" ? d : String(d)); },
+  writeLine(d) { appendLog(d + "\n"); }
+};
+
+function appendLog(s) {
+  const el = $("term");
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.textContent += s;
+  const m = s.match(/(\d+(?:\.\d+)?)\s*%/);
+  if (m) setProgress(Math.min(1, parseFloat(m[1]) / 100));
+  if ($("autoscroll").checked && atBottom) el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, cls) {
+  $("status").textContent = text;
+  $("dot").className = "dot" + (cls ? " " + cls : "");
+}
+function setProgress(v) {
+  const p = $("prog");
+  if (v == null) p.removeAttribute("value"); else p.value = v;
+}
+
+$("tabFlash").onclick = () => switchTab("Flash");
+$("tabMon").onclick = () => switchTab("Mon");
+$("tabIDE").onclick = () => switchTab("IDE");
+$("tabPins").onclick = () => switchTab("Pins");
+function switchTab(name) {
+  for (const n of ["Flash", "Mon", "IDE", "Pins"]) {
+    $("tab" + n).classList.toggle("act", name === n);
+    $("pane" + n).classList.toggle("act", name === n);
+  }
+}
+
+$("btnConnect").onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    onConnected();
+  } catch (e) { /* 用户取消 */ }
+};
+function onConnected() {
+  setStatus("已连接（未打开）", "on");
+  $("btnConnect").disabled = true;
+  $("btnDisconnect").disabled = false;
+  for (const id of ACTION_BTNS) $(id).disabled = false;
+}
+$("btnDisconnect").onclick = async () => {
+  await stopMonitor();
+  try { if (port.readable || port.writable) await port.close(); } catch {}
+  port = null;
+  setStatus("未连接", "");
+  $("btnConnect").disabled = false;
+  $("btnDisconnect").disabled = true;
+  for (const id of ACTION_BTNS) $(id).disabled = true;
+};
+
+async function ensurePortClosed() {
+  if (monitoring) await stopMonitor();
+  try { await mp?.close(); } catch {}
+  try { await port.close(); } catch {}
+}
+
+async function getLoader() {
+  await ensurePortClosed();
+  const transport = new Transport(port, false);
+  const loader = new ESPLoader({ transport, baudrate: 115200, terminal: term });
+  const chip = await loader.main();
+  term.writeLine(`芯片: ${chip}`);
+  const baud = parseInt($("baud").value, 10);
+  if (baud !== 115200) {
+    try { await loader.changeBaudRate(baud); } catch { term.writeLine("提速失败，沿用 115200"); }
+  }
+  return { transport, loader };
+}
+
+$("btnFlash").onclick = async () => {
+  const file = $("fwFile").files[0];
+  if (!file) return alert("请先选择 .bin 固件");
+  const addr = parseInt($("fwAddr").value, 16);
+  if (isNaN(addr)) return alert("烧录地址无效，例如 0x0 或 0x10000");
+
+  busy(true);
+  setProgress(null);
+  let transport, loader;
+  try {
+    ({ transport, loader } = await getLoader());
+    const data = new Uint8Array(await file.arrayBuffer());
+    term.writeLine(`固件 ${file.name} (${data.length} 字节) @ 0x${addr.toString(16)}`);
+    await loader.writeFlash({
+      fileArray: [{ data, address: addr }],
+      flashSize: "keep", flashMode: "keep", flashFreq: "keep",
+      eraseAll: $("eraseAll").checked, compress: true,
+      reportSpeed: v => { if (v <= 1) setProgress(v); else if (v <= 100) setProgress(v / 100); }
+    });
+    await loader.hardReset();
+    setProgress(1);
+    term.writeLine("烧录完成，已复位启动。");
+  } catch (e) {
+    term.writeLine("\n烧录失败: " + (e?.message || e));
+  } finally {
+    try { await transport?.disconnect(); } catch {}
+    busy(false);
+  }
+};
+
+$("btnErase").onclick = async () => {
+  if (!confirm("确定整片擦除 Flash？")) return;
+  busy(true);
+  let transport, loader;
+  try {
+    ({ transport, loader } = await getLoader());
+    if (typeof loader.eraseFlash === "function") await loader.eraseFlash();
+    else term.writeLine("当前库不支持 eraseFlash");
+    term.writeLine("擦除完成。");
+  } catch (e) {
+    term.writeLine("擦除失败: " + (e?.message || e));
+  } finally {
+    try { await loader?.hardReset(); } catch {}
+    try { await transport?.disconnect(); } catch {}
+    busy(false);
+  }
+};
+
+function busy(on) {
+  for (const id of ACTION_BTNS) $(id).disabled = on;
+}
+
+/* ---------- 串口监视 ---------- */
+$("btnMon").onclick = () => monitoring ? stopMonitor() : startMonitor();
+
+async function startMonitor() {
+  try {
+    await ensurePortClosed();
+    await port.open({ baudRate: monitorBaud });
+  } catch (e) { return term.writeLine("打开串口失败: " + e.message); }
+  monitoring = true;
+  setStatus(`监视中 @ ${monitorBaud}`, "run");
+  $("btnMon").textContent = "停止监视";
+  const dec = new TextDecoder();
+  const loop = async () => {
+    while (monitoring && port.readable) {
+      reader = port.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) appendLog(dec.decode(value, { stream: true }));
+        }
+      } catch (e) {
+        if (/device has been lost|No device|disconnect/i.test(String(e?.message || e)))
+          return handleDeviceLost();
+        term.writeLine("\n[串口错误] " + (e?.message || e));
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+    }
+  };
+  await loop();
+  await closeQuietly();
+}
+
+async function stopMonitor() {
+  if (!monitoring) return;
+  monitoring = false;
+  try { await reader?.cancel(); } catch {}
+  await closeQuietly();
+  setStatus("已连接（未打开）", "on");
+  $("btnMon").textContent = "开始监视";
+}
+
+async function closeQuietly() {
+  try { reader?.releaseLock(); } catch {}
+  try { writer?.releaseLock(); } catch {}
+  reader = null; writer = null;
+  try { await port?.close(); } catch {}
+}
+
+$("btnReset").onclick = async () => {
+  try {
+    if (!port.writable) await port.open({ baudRate: monitorBaud });
+    // 典型自动复位电路：RTS=EN，DTR=IO0；IO0 拉高后脉冲 EN
+    await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+    await new Promise(r => setTimeout(r, 100));
+    await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+  } catch (e) { term.writeLine("复位失败: " + e.message); }
+};
+
+$("btnSend").onclick = sendData;
+$("sendInput").addEventListener("keydown", e => { if (e.key === "Enter") sendData(); });
+async function sendData() {
+  let text = $("sendInput").value;
+  if (!text) return;
+  if ($("addNL").checked) text += "\n";
+  try {
+    if (!port.writable) await port.open({ baudRate: monitorBaud });
+    if (!writer) writer = port.writable.getWriter();
+    await writer.write(new TextEncoder().encode(text));
+    $("sendInput").value = "";
+  } catch (e) { term.writeLine("发送失败: " + e.message); }
+}
+
+$("btnClear").onclick = () => term.clean();
+
+/* ---------- MicroPython raw REPL / 文件管理 ---------- */
+const outEl = $("out");
+function outPrint(s) {
+  outEl.textContent += s;
+  outEl.scrollTop = outEl.scrollHeight;
+}
+let ideBusy = false;
+
+// @@rawrepl-begin
+function createRawRepl(getStreams, onLost) {
+  const lost = e => {
+    if (/device has been lost|No device|disconnect|not connected/i.test(String(e?.message || e)))
+      onLost?.();
+  };
+  let ideR = null, ideW = null, closeFn = null, inRaw = false, rxBuf = "", booted = false;
+  const rxDec = new TextDecoder();
+  const tick = ms => new Promise(r => setTimeout(r, ms));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function readLoop() {
+    while (ideR) {
+      try {
+        const { value, done } = await ideR.read();
+        if (done) break;
+        if (value) rxBuf += rxDec.decode(value, { stream: true });
+      } catch (e) { lost(e); break; }
+    }
+  }
+  async function ensureOpen() {
+    if (ideW) return;
+    const s = await getStreams();
+    ideR = s.reader; ideW = s.writer; closeFn = s.close;
+    rxBuf = "";
+    readLoop();
+    if (!booted) { await forceRestart(); booted = true; }
+  }
+  // 软重启(Ctrl-D，不重枚举 USB) + 启动期连续 Ctrl-C，阻止 main.py 及其定时器
+  async function forceRestart() {
+    inRaw = false;
+    await ideW.write(new Uint8Array([2]));   // 先退到友好 REPL
+    await tick(100);
+    await ideW.write(new Uint8Array([3]));   // 打断当前运行
+    await tick(100);
+    rxBuf = "";
+    await ideW.write(new Uint8Array([4]));   // Ctrl-D 软重启
+    // 启动窗口内持续 Ctrl-C，拦截 boot/main.py
+    const spamEnd = Date.now() + 1500;
+    while (Date.now() < spamEnd) {
+      await ideW.write(new Uint8Array([3]));
+      await tick(40);
+    }
+    rxBuf = "";
+    await ideW.write(new Uint8Array([1]));   // Ctrl-A 进 raw
+    await expect(">", 3000);
+    inRaw = true;
+    // 静默校验：300ms 内无任何输出才算干净
+    rxBuf = "";
+    await tick(300);
+    if (rxBuf.length)
+      throw new Error("板载程序仍在后台输出（定时器/线程无法被 Ctrl-C 停止），请在程序中加停止逻辑或禁用其自动启动");
+  }
+
+  async function close() {
+    const r = ideR, w = ideW, fn = closeFn;
+    ideR = null; ideW = null; closeFn = null; inRaw = false;
+    try { await r?.cancel(); } catch {}
+    for (const x of [r, w]) { try { x?.releaseLock(); } catch {} }
+    try { await fn?.(); } catch {}
+  }
+  async function drain(time = 200) {
+    await tick(time);
+    const s = rxBuf; rxBuf = ""; return s;
+  }
+  async function expect(token, timeout = 4000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const i = rxBuf.indexOf(token);
+      if (i >= 0) { rxBuf = rxBuf.slice(i + token.length); return; }
+      await tick(15);
+    }
+    throw new Error("等待响应超时: " + JSON.stringify(token) + " 已收到: " + rxBuf.slice(-120));
+  }
+  async function enterRaw() {
+    if (inRaw) return;
+    await ideW.write(new Uint8Array([3, 3]));
+    await drain(200);
+    await ideW.write(new Uint8Array([1]));
+    await expect(">", 3000);
+    inRaw = true;
+  }
+  async function exitRaw() {
+    if (!inRaw) return;
+    await ideW.write(new Uint8Array([2]));
+    await sleep(100);
+    inRaw = false;
+  }
+  async function readFrame(timeout) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const i = rxBuf.indexOf("\x04");
+      if (i >= 0) { const s = rxBuf.slice(0, i); rxBuf = rxBuf.slice(i + 1); return s; }
+      await tick(15);
+    }
+    inRaw = false;   // 丢弃本次会话，下次 enterRaw 重新同步
+    await ideW.write(new Uint8Array([3]));
+    throw new Error("执行超时，已发送 Ctrl-C");
+  }
+  async function execRaw(code, timeout = 10000) {
+    await enterRaw();
+    await ideW.write(new TextEncoder().encode(code));
+    rxBuf = "";   // 设备收到 Ctrl-D 才会回 OK，此前缓冲中的都是晚到垃圾
+    await ideW.write(new Uint8Array([4]));
+    await expect("OK", 3000);
+    if (rxBuf.startsWith("\r\n")) rxBuf = rxBuf.slice(2);
+    else if (rxBuf[0] === "\r" || rxBuf[0] === "\n") rxBuf = rxBuf.slice(1);
+    const stdout = await readFrame(timeout);
+    const stderr = await readFrame(3000);
+    if (stderr.trim()) throw new Error(stderr.trim());
+    return stdout;
+  }
+
+  // 标记定界：忽略数据流中误插入的 EOT，抗 USB 包边界错位
+  async function collectMarked(code, begin, end, timeout = 20000) {
+    await enterRaw();
+    await ideW.write(new TextEncoder().encode(code));
+    rxBuf = "";
+    await ideW.write(new Uint8Array([4]));
+    await expect("OK", 3000);
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const e = rxBuf.indexOf(end);
+      if (e >= 0) return rxBuf.slice(0, e).replace(/\x04/g, "");
+      await tick(15);
+    }
+    await ideW.write(new Uint8Array([3]));
+    inRaw = false;
+    throw new Error("传输超时，末尾: " + rxBuf.slice(-80));
+  }
+
+  const b64 = b => btoa(String.fromCharCode(...b));
+  async function fsList() {
+    const out = await execRaw("import os\nfor n in os.listdir('/'):\n print(n)\n");
+    return out.split("\n").map(s => s.trim()).filter(Boolean);
+  }
+  async function fsGet(name) {
+    const raw = await collectMarked(
+      "import ubinascii,sys\n" +
+      "sys.stdout.write('@@B6BEG@@')\n" +
+      "sys.stdout.write(ubinascii.b2a_base64(open('" + name + "','rb').read()).decode())\n" +
+      "sys.stdout.write('@@B6END@@')\n",
+      "@@B6BEG@@", "@@B6END@@", 20000
+    );
+    const b = raw.indexOf("@@B6BEG@@");
+    let s = (b >= 0 ? raw.slice(b + 9) : raw).replace(/\s+/g, "");
+    if (!/^[A-Za-z0-9+/=]*$/.test(s))
+      throw new Error("base64 响应异常: " + s.slice(0, 60));
+    const bin = atob(s);
+    return new Uint8Array([...bin].map(c => c.charCodeAt(0)));
+  }
+  async function fsPut(name, data) {
+    await execRaw("f=open('" + name + "','wb')\n");
+    for (let i = 0; i < data.length; i += 480) {
+      await execRaw("f.write(ubinascii.a2b_base64('" + b64(data.subarray(i, i + 480)) + "'))\n");
+    }
+    await execRaw("f.close()\n");
+  }
+  async function fsDelete(name) {
+    await execRaw("import os\nos.remove('" + name + "')\n");
+  }
+  // 流式运行：实时回调输出，不死等结束；ctl.cancelled 后 Ctrl-C 停止
+  let runCtl = null;
+  async function runStream(code, onOut) {
+    await enterRaw();
+    await ideW.write(new TextEncoder().encode(code));
+    rxBuf = "";
+    await ideW.write(new Uint8Array([4]));
+    await expect("OK", 3000);
+    if (rxBuf.startsWith("\r\n")) rxBuf = rxBuf.slice(2);
+    else if (rxBuf[0] === "\r" || rxBuf[0] === "\n") rxBuf = rxBuf.slice(1);
+
+    runCtl = { cancelled: false };
+    let frame = 0, stderr = "";
+    while (!runCtl.cancelled) {
+      await tick(40);
+      let s = rxBuf; rxBuf = "";
+      while (s.length) {
+        const i = s.indexOf("\x04");
+        if (i < 0) { if (frame === 0) onOut(s); else stderr += s; break; }
+        const part = s.slice(0, i);
+        if (frame === 0) { onOut(part); frame = 1; }
+        else { stderr += part; frame = 2; }
+        s = s.slice(i + 1);
+      }
+      if (frame === 2) { runCtl = null; return { finished: true, cancelled: false, stderr }; }
+    }
+    runCtl = null;
+    inRaw = false;   // 中断后需重新进 raw 同步
+    await ideW.write(new Uint8Array([3]));
+    return { finished: false, cancelled: true, stderr: "" };
+  }
+  function cancelRun() { if (runCtl) runCtl.cancelled = true; }
+
+  async function interrupt() { await ideW.write(new Uint8Array([3])); }
+  async function softReboot() {
+    await exitRaw();
+    await ideW.write(new Uint8Array([3, 4]));
+    return await drain(1200);
+  }
+
+  return { ensureOpen, close, forceRestart, execRaw, runStream, cancelRun, fsList, fsGet, fsPut, fsDelete, interrupt, softReboot };
+}
+// @@rawrepl-end
+
+function handleDeviceLost() {
+  if (!port) return;
+  pmCtl?.stop(); pmCtl = null;
+  port = null; mp = null; monitoring = false; isRunning = false;
+  setStatus("设备已掉线，请重新连接", "");
+  $("btnConnect").disabled = false;
+  $("btnDisconnect").disabled = true;
+  for (const id of ACTION_BTNS) $(id).disabled = true;
+  $("pmStart").disabled = true; $("pmStop").disabled = true;
+  for (const id of ["pmChip","pmPull","pmInterval","pmAllDigital","pmAllAdc","pmAllSkip"])
+    $(id).disabled = false;
+  renderGrid(false);
+}
+mp = createRawRepl(async () => {
+  if (monitoring) await stopMonitor();
+  if (!port.readable && !port.writable) await port.open({ baudRate: monitorBaud });
+  return {
+    reader: port.readable.getReader(),
+    writer: port.writable.getWriter(),
+    close: () => port.close()
+  };
+}, handleDeviceLost);
+
+function ideGuard(fn) {
+  return async (...a) => {
+    if (ideBusy) return;
+    if (!port) return alert("请先连接串口");
+    ideBusy = true;
+    try {
+      await mp.ensureOpen();
+      await fn(...a);
+    } catch (e) {
+      outPrint("[错误] " + (e?.message || e) + "\n");
+    } finally { ideBusy = false; }
+  };
+}
+
+async function fillFileList() {
+  const names = await mp.fsList();
+  const sel = $("fileList");
+  sel.innerHTML = "";
+  for (const n of names) sel.add(new Option(n));
+  outPrint("共 " + names.length + " 个文件\n");
+}
+$("btnRefresh").onclick = ideGuard(fillFileList);
+
+$("btnUpload").onclick = () => $("upFile").click();
+$("upFile").onchange = ideGuard(async () => {
+  const f = $("upFile").files[0];
+  if (!f) return;
+  await mp.fsPut(f.name, new Uint8Array(await f.arrayBuffer()));
+  outPrint("已上传 " + f.name + "\n");
+  $("upFile").value = "";
+  await fillFileList();
+});
+$("btnOpen").onclick = ideGuard(async () => {
+  const name = $("fileList").value;
+  if (!name) return;
+  const data = await mp.fsGet(name);
+  $("edName").value = name;
+  $("editor").value = new TextDecoder().decode(data);
+  outPrint("已打开 " + name + " (" + data.length + " 字节)\n");
+});
+$("btnDel").onclick = ideGuard(async () => {
+  const name = $("fileList").value;
+  if (!name || !confirm("删除 " + name + " ?")) return;
+  await mp.fsDelete(name);
+  await fillFileList();
+});
+let isRunning = false;
+$("btnRun").onclick = async () => {
+  if (isRunning) return;
+  if (!port) return alert("请先连接串口");
+  try {
+    await mp.ensureOpen();
+  } catch (e) { return outPrint("[错误] " + (e?.message || e) + "\n"); }
+  isRunning = true;
+  for (const id of ACTION_BTNS) if (id !== "btnStop") $(id).disabled = true;
+  $("btnStop").disabled = false;
+  outPrint(">>> 运行 " + $("edName").value + "（Ctrl-C 停止）\n");
+  const res = await mp.runStream($("editor").value, s => outPrint(s));
+  if (res.stderr.trim()) outPrint("\n" + res.stderr);
+  if (res.finished) outPrint("\n[程序正常结束]\n");
+  else outPrint("\n[已 Ctrl-C 停止]\n");
+  isRunning = false;
+  for (const id of ACTION_BTNS) $(id).disabled = false;
+};
+$("btnSave").onclick = ideGuard(async () => {
+  const name = $("edName").value.trim();
+  if (!name) return;
+  await mp.fsPut(name, new TextEncoder().encode($("editor").value));
+  outPrint("已保存到 " + name + "\n");
+  await fillFileList();
+});
+$("btnStop").onclick = async () => {
+  if (isRunning) return mp.cancelRun();
+  return ideGuard(async () => {
+    await mp.interrupt();
+    outPrint("[Ctrl-C]\n");
+  })();
+};
+$("btnReboot").onclick = ideGuard(async () => {
+  outPrint("[强制重启并进入 raw REPL]\n");
+  await mp.forceRestart();
+});
+
+$("btnDisconnect").onclick = (orig => async () => {
+  pmCtl?.stop(); pmCtl = null;
+  try { await mp?.close(); } catch {}
+  return orig();
+})($("btnDisconnect").onclick);
+
+/* ---------- 全部引脚监测 ---------- */
+// @@pinmon-begin
+const PIN_PROFILES = {
+  s3:   { candidates: range(0,49), adc2: range(11,21) },
+  esp32:{ candidates: range(0,40),
+          adc2: [4,0,2].concat(range(12,16),[27,25,26]) },
+  c3:   { candidates: range(0,22), adc2: [] }
+};
+function range(a,b) { const r=[]; for(let i=a;i<b;i++) r.push(i); return r; }
+
+function defaultCfg(profile) {
+  return profile.candidates.map(p => ({ pin:p, mode:"d" }));
+}
+function cycleCfg(cfg, caps, pin) {
+  const c = cfg.find(x => x.pin === pin);
+  if (!c || c.mode === "x") return;
+  c.mode = c.mode === "d" ? (caps.a.includes(pin) ? "a" : "skip")
+        : c.mode === "a" ? "skip" : "d";
+}
+
+// 板端探测：固件拒绝的脚（Flash/PSRAM 占用）会被 try 过滤
+const PM_PROBE =
+  "import machine,json\n" +
+  "_d=[];_a=[]\n" +
+  "for _p in CAND:\n" +
+  "    try:\n" +
+  "        machine.Pin(_p,machine.Pin.IN);_d.append(_p)\n" +
+  "    except Exception:pass\n" +
+  "    try:\n" +
+  "        machine.ADC(machine.Pin(_p));_a.append(_p)\n" +
+  "    except Exception:pass\n" +
+  "print(json.dumps({'d':_d,'a':_a}))\n";
+async function probeCaps(exec, candidates) {
+  const s = await exec(PM_PROBE.replace("CAND", JSON.stringify(candidates)), 15000);
+  return JSON.parse(s.trim());
+}
+function buildInitScript(cfg, pull) {
+  const entries = cfg.filter(c => c.mode === "d" || c.mode === "a")
+    .map(c => "(" + c.pin + ",'" + c.mode + "')").join(",");
+  return [
+    "import machine",
+    "_pm={'none':None,'up':machine.Pin.PULL_UP,'down':machine.Pin.PULL_DOWN}",
+    "_objs={}",
+    "_cfg=[" + entries + "]",
+    "for p,m in _cfg:",
+    "    if m=='a':",
+    "        o=machine.ADC(machine.Pin(p))",
+    "        o.atten(machine.ADC.ATTN_11DB)",
+    "        _objs[p]=(o,'a')",
+    "    else:",
+    "        _objs[p]=(machine.Pin(p,machine.Pin.IN,_pm['" + pull + "']),'d')",
+    ""
+  ].join("\n");
+}
+const PM_POLL =
+  "print(__import__('json').dumps({str(p):(o.read() if t=='a' else o.value()) " +
+  "for p,(o,t) in _objs.items()}))\n";
+
+// 直接控制：一次性脚本；PWM 对象按引脚缓存，滑块移动只改 duty
+function buildPinSet(pin, v) {
+  return "import machine\nmachine.Pin(" + pin + ",machine.Pin.OUT).value(" + v + ")\n";
+}
+function buildPwmDuty(pin, duty) {
+  return [
+    "import machine",
+    "try:",
+    " _pcp",
+    "except NameError:",
+    " _pcp={}",
+    "if " + pin + " not in _pcp:",
+    " _pcp[" + pin + "]=machine.PWM(machine.Pin(" + pin + "))",
+    " _pcp[" + pin + "].freq(1000)",
+    "_pcp[" + pin + "].duty(" + duty + ")",
+    ""
+  ].join("\n");
+}
+
+function createPinMonitor(exec) {
+  let timer = null, running = false, pending = false, vals = {}, prev = {};
+  async function poll(onPoll) {
+    if (pending) return;
+    pending = true;
+    try {
+      const s = await exec(PM_POLL, 6000);
+      vals = JSON.parse(s.trim());
+      const changed = [];
+      for (const k of Object.keys(vals))
+        if (prev[k] !== vals[k] && k in prev) changed.push(+k);
+      prev = { ...vals };
+      onPoll(vals, changed);
+    } finally { pending = false; }
+  }
+  async function start(cfg, pull, intervalMs, onPoll) {
+    await exec(buildInitScript(cfg, pull), 8000);
+    prev = {};
+    running = true;
+    timer = setInterval(() => poll(onPoll).catch(() => {}), intervalMs);
+    await poll(onPoll);
+  }
+  function stop() {
+    clearInterval(timer);
+    timer = null; running = false;
+  }
+  return { start, stop, poll, get running() { return running; } };
+}
+// @@pinmon-end
+
+let pmCtl = null, pmCfg = null, pmCaps = null;
+function pmProfile() { return PIN_PROFILES[$("pmChip").value]; }
+
+function renderGrid(mon) {
+  const grid = $("pmGrid");
+  grid.innerHTML = "";
+  for (const c of pmCfg) {
+    const chip = document.createElement("div");
+    chip.className = "pm-chip " +
+      (c.mode === "x" ? "bad" : c.mode === "skip" ? "skip" :
+       c.mode === "a" ? "ad" : "lo") + (mon ? " mon" : "");
+    chip.dataset.pin = c.pin;
+    const tag = c.mode === "x" ? "✕" : c.mode === "a" ? "A"
+              : c.mode === "skip" ? "×" : "D";
+    chip.innerHTML = '<div class="n">IO' + c.pin + ' ' + tag + '</div><div class="v">' +
+      (c.mode === "x" || c.mode === "skip" ? "—" : mon ? "" : "?") + '</div>';
+    if (!mon && c.mode !== "x") chip.onclick = () => {
+      cycleCfg(pmCfg, pmCaps, c.pin);
+      renderGrid(false);
+    };
+    grid.appendChild(chip);
+  }
+}
+function updateChips(vals, changed) {
+  for (const c of pmCfg) {
+    const chip = $("pmGrid").querySelector('[data-pin="' + c.pin + '"]');
+    if (!chip || c.mode === "skip" || c.mode === "x") continue;
+    const v = vals[c.pin];
+    if (v == null) continue;
+    const vEl = chip.querySelector(".v");
+    if (c.mode === "a") {
+      vEl.textContent = v;
+      chip.style.opacity = String(0.55 + 0.45 * (v / 4095));
+    } else {
+      vEl.textContent = v;
+      chip.classList.toggle("hi", v === 1);
+      chip.classList.toggle("lo", v === 0);
+    }
+    if (changed.includes(c.pin)) {
+      chip.classList.add("changed");
+      setTimeout(() => chip.classList.remove("changed"), 250);
+    }
+  }
+}
+
+$("pmChip").onchange = () => {
+  pmCaps = null; pmCfg = defaultCfg(pmProfile()); renderGrid(false);
+};
+$("pmAllDigital").onclick = () => {
+  for (const c of pmCfg) if (c.mode !== "x") c.mode = "d";
+  renderGrid(false);
+};
+$("pmAllAdc").onclick = () => {
+  for (const c of pmCfg)
+    c.mode = c.mode === "x" ? "x" : (pmCaps?.a.includes(c.pin) ? "a" : "skip");
+  renderGrid(false);
+};
+$("pmAllSkip").onclick = () => {
+  for (const c of pmCfg) if (c.mode !== "x") c.mode = "skip";
+  renderGrid(false);
+};
+
+$("pmStart").onclick = async () => {
+  if (!port) return alert("请先连接串口");
+  if (pmCfg.every(c => c.mode !== "d" && c.mode !== "a"))
+    return alert("至少选一个引脚");
+  try {
+    await mp.ensureOpen();
+  } catch (e) { return $("pmStatus").textContent = "连接失败: " + e.message; }
+  $("pmStatus").textContent = "正在探测可用引脚…";
+  try {
+    pmCaps = await probeCaps((code, t) => mp.execRaw(code, t), pmProfile().candidates);
+    for (const c of pmCfg)
+      if (!pmCaps.d.includes(c.pin) && c.mode !== "skip") c.mode = "x";
+  } catch (e) {
+    return $("pmStatus").textContent = "探测失败: " + (e?.message || e);
+  }
+  if (pmCfg.every(c => c.mode !== "d" && c.mode !== "a"))
+    return $("pmStatus").textContent = "没有可监测的引脚";
+  pmCtl = createPinMonitor((code, t) => mp.execRaw(code, t));
+  $("pmStatus").textContent = "监测中…";
+  $("pmStart").disabled = true; $("pmStop").disabled = false;
+  for (const id of ["pmChip","pmPull","pmInterval","pmAllDigital","pmAllAdc","pmAllSkip"])
+    $(id).disabled = true;
+  renderGrid(true);
+  try {
+    await pmCtl.start(pmCfg, $("pmPull").value, parseInt($("pmInterval").value, 10), updateChips);
+  } catch (e) {
+    $("pmStatus").textContent = "监测出错: " + (e?.message || e);
+    pmCtl.stop();
+    try { await mp.close(); } catch {}   // 清理会话，避免影响串口调试
+    pmCaps = null;
+    $("pmStart").disabled = false; $("pmStop").disabled = true;
+    for (const id of ["pmChip","pmPull","pmInterval","pmAllDigital","pmAllAdc","pmAllSkip"])
+      $(id).disabled = false;
+  }
+};
+$("pmStop").onclick = () => {
+  pmCtl?.stop();
+  $("pmStatus").textContent = "已停止";
+  $("pmStart").disabled = false; $("pmStop").disabled = true;
+  for (const id of ["pmChip","pmPull","pmInterval","pmAllDigital","pmAllAdc","pmAllSkip"])
+    $(id).disabled = false;
+  renderGrid(false);
+};
+
+/* 直接控制栏 */
+$("pcKind").onchange = () => {
+  const pwm = $("pcKind").value === "p";
+  $("pcToggle").style.display = pwm ? "none" : "";
+  $("pcPwmRow").style.display = pwm ? "" : "none";
+};
+let pcVal = 0, pcTimer = null;
+async function pcSend(script) {
+  if (!port) return $("pcStatus").textContent = "请先连接串口";
+  try {
+    await mp.ensureOpen();
+    await mp.execRaw(script, 4000);
+    $("pcStatus").textContent = "已发送";
+  } catch (e) {
+    $("pcStatus").textContent = "失败: " + (e?.message || e).split("\n")[0];
+  }
+}
+$("pcToggle").onclick = () => {
+  pcVal = pcVal ? 0 : 1;
+  $("pcToggle").textContent = pcVal ? "置低" : "置高";
+  pcSend(buildPinSet(parseInt($("pcPin").value, 10), pcVal));
+};
+$("pcDuty").oninput = () => {
+  const d = parseInt($("pcDuty").value, 10);
+  $("pcDutyVal").textContent = d;
+  clearTimeout(pcTimer);
+  pcTimer = setTimeout(
+    () => pcSend(buildPwmDuty(parseInt($("pcPin").value, 10), d)), 60);
+};
+
+pmCfg = defaultCfg(pmProfile());
+renderGrid(false);
+
+if (!("serial" in navigator)) {
+  $("status").textContent = "当前浏览器不支持 Web Serial，请用 Chrome / Edge";
+  $("status").classList.add("err");
+}
+</script>
+</body>
+</html>
